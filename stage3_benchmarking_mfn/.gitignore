@@ -1,0 +1,17 @@
+# Source workbooks (may contain sensitive rate/volume data) — keep out of git
+*.xlsm
+*.xlsx
+
+# Data exports / scratch
+*.csv
+
+# Secrets
+.env
+
+# Deal Tracker local store (may contain customer/commercial data)
+deal_records.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

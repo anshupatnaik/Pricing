@@ -1,0 +1,106 @@
+{
+  "_title": "DRAFT crosswalk v2 — for review (not yet wired into the app)",
+  "_approach": "Per the data product owner: DO NOT hand-map names. Use the RM Lookups to standardize both sides and JOIN. Rates come from the Benchmarking (BEM) tables (pre-processed, SKU-based); volume from the TOS moves view. Remaining work is attribute (SKU) mapping — done by Claude.",
+
+  "data_sources": {
+    "rates": "\"APMT-BEATS\".\"Global\".\"insights_and_visualizations\".\"Pricing Automation Workflow\".\"Benchmarking\".\"BEM_Pricing_Base\"  (+ BEM_Pricing_Overtime, BEM_Pricing_Surcharge, BEM_Volume)",
+    "tos_volume": "\"APMT-BEATS\".\"Global\".\"insights_and_visualizations\".\"Vessel Moves Insights - Power BI\".\"GBL_moves_simulator\"  (has a ready-made `key` column, e.g. 'Full-Discharge-20')",
+    "terminal_lookup": "\"Pricing Automation Workflow\".\"Lookups\".\"Terminal_mapping\"  (terminalName -> Standard_Terminal; 8,412 alias rows)",
+    "customer_lookup": "\"Pricing Automation Workflow\".\"Lookups\".\"Customer_mapping\"  (Operator -> Standard_Operator_Code, Standard_Operator_Name)",
+    "activity_catalogue": "Confirm the load/discharge quay activities against the global activity catalogue; the working set is under quay_move_activities below."
+  },
+
+  "join_keys": {
+    "terminal": "TOS.terminalname -> Terminal_mapping.Standard_Terminal  ==  BEM.Pricing_Terminal -> Terminal_mapping.Standard_Terminal",
+    "operator": "TOS.unit_container_operator_id (already a Standard_Operator_Code, e.g. HMM/MAE/MSC/ONE)  ==  Customer_mapping[BEM.Customer].Standard_Operator_Code",
+    "sku": "map TOS.key attributes (freight/direction/length + category) to BEM.SKU attributes (activity_name, Freight_Type, Direction, Container_Length) — see sku_mapping."
+  },
+
+  "terminal_bridge": {
+    "auto_matched_via_standard": [
+      "Aarhus","Barcelona","Buenaventura","Buenos Aires","Gijon","Gothenburg","Lazaro",
+      "Los Angeles","Mobile","Pecem","Pipavav","Port Elizabeth","Quetzal","Valencia","Yucatan"
+    ],
+    "manual_overrides_needed": {
+      "Vado2": {
+        "issue": "Terminal_mapping maps 'Vado2' -> 'Vado2' (unmapped), but pricing 'Vado Ligure' -> 'Vado Gateway Terminal (APM Terminals)'. Join fails without an override.",
+        "override_standard_terminal": "Vado Gateway Terminal (APM Terminals)",
+        "action": "Use this override in the tool; also ask the DPO to add 'Vado2' as an alias in Terminal_mapping.",
+        "reefer_note": "'Vado Reefer' (standard 'Reefer Terminal Vado') holds reefer-specific sheets — optional overlay for reefer rates."
+      }
+    },
+    "tos_terminals_without_BEM_pricing": [
+      "Algeciras","Apapa","Aqaba","Bahrain","Callao","GTI Mumbai","MaasvlakteII","Miami","Moin",
+      "Monrovia","Onne","PortSaid","Poti","Rijeka","Salala","Tangier","Tangier Med 2 (TMII)"
+    ],
+    "BEM_terminals_without_TOS_moves": ["Suape","Yokohama"]
+  },
+
+  "operator_bridge": {
+    "note": "Replaces the earlier hand-built name-pattern map. TOS operator codes equal the Standard_Operator_Code; BEM.Customer maps to the same via Customer_mapping.",
+    "examples": {
+      "HMM": "HMM Co. Ltd / HMM HQ / 'HMM' -> code HMM",
+      "MAE": "Maersk Line / Maersk Line HQ / A.P. Moller - Maersk A/S / 'MAE' -> code MAE",
+      "MSC": "MSC / MSC HQ -> code MSC",
+      "ONE": "ONE / ONE HQ -> code ONE"
+    },
+    "unmapped_codes": "Junk TOS codes (DUMMY/TEST/UNK/IMO-numbers) and codes with no rate sheet -> no current rate; fall back to a pricing-Customer picker / upload / manual."
+  },
+
+  "quay_move_activities": {
+    "_comment": "Load/Discharge move family to include (confirm vs global catalogue). Restow/Transshipment carry the 1-move-vs-2-move caveat below.",
+    "include": [
+      "Load or Discharge Move","Load or Discharge Move excl Yard Move","Load Move","Discharge Move",
+      "Gateway Cycle Move","Gateway Cycle Move - Import","Gateway Cycle Move - Export",
+      "Throughput Move (Standard Lift)","Transshipment Move","Transshipment Move - Premium Service",
+      "Load or Discharge Move - Premium Service","Load or Discharge Move - Cabotage (coastal)",
+      "Cabotage (coastal) - Load or Discharge Move","Load or Discharge Move - Bundled Platform or Flat rack",
+      "Restow Move - via Quay","Restow Move - Cell to Cell","Restow Move - Via Quay - Premium Service","Restow Move - Cell to Cell - Premium Service"
+    ],
+    "exclude_ancillary": [
+      "Breakbulk Handling","OOG - Using Slings","Gear Box Move","Hatch Cover Move","Hatch Cover Move - Cell to Cell",
+      "Hatch Cover Move - Via Quay","Lashing","Unlashing","Lashing On-Deck Containers","Lashing Services - 3rd Party Feeder",
+      "Twist Lock Removal","Yard Move - Quay"
+    ]
+  },
+
+  "sku_mapping": {
+    "_comment": "TOS.key -> BEM.SKU attribute mapping (Claude task #3). BEM.SKU = activity_name_ContainerLength_Direction_FreightType_ContainerType.",
+    "tos_key_patterns": {
+      "gateway": "'{Freight}-{Direction}-{Length}'  e.g. 'Full-Discharge-20'  (Freight=Full/Empty, Direction=Load/Discharge)",
+      "other":   "'{Category}-{Freight}-{Length}'   e.g. 'Transhipment-Full-20', 'Restow via quay-Empty-40', 'STRGE-Empty-20'"
+    },
+    "length_map": {"20":"20 ft","40":"40 ft","45":"45 ft"},
+    "length_handling": "APPROVED: include ONLY 20/40/45 ft. Any other length (24, blank, etc.) is EXCLUDED from the simulation.",
+    "freight_map": {"Full":"Full","Empty":"Empty"},
+    "category_to_activity": {
+      "gateway (Full/Empty-Load/Discharge)": "Load or Discharge Move (fallback Gateway Cycle Move / Load Move / Discharge Move)",
+      "Transhipment": "Transshipment Move",
+      "Restow via quay": "Restow Move - via Quay",
+      "STRGE": "EXCLUDED (storage, not a quay move)"
+    },
+    "rate_fallback": "Use the length/freight/direction-specific SKU when present; else fall back to the activity's blended SKU (Container_Length/Freight_Type='Any'). Current sheets are often blended ('Any')."
+  },
+
+  "one_move_vs_cycle_caveat": {
+    "_from_reviewer": "BEM rate is per SINGLE move (half cycle). TOS volume is also per single move. So revenue = BEM_rate x TOS_moves directly (NO divide-by-2 by default). However, in the underlying pricing some rates are quoted per single move and some per 2 moves (full cycle).",
+    "rule": "DEFAULT: rate basis = per single move -> revenue = rate x moves. Expose a per-activity 'rate basis' toggle; if an activity's pricing is per cycle (2 moves), convert to per-move (rate / 2) before multiplying by moves. Applies mainly to Transshipment/Restow."
+  },
+
+  "rate_sheet_selection": {
+    "effective": "Keep rows where EffectiveStartDate <= today <= EffectiveEndDate (exclude EXPIRED/DRAFT).",
+    "hq_vs_local_tiebreak": [
+      "1) If both an HQ and a local-entity sheet are effective, choose the one with the LATEST contract start date.",
+      "2) If start date AND end date are identical (still tied), ASK THE USER to choose which rate sheet to pull — and allow them to upload an Excel/CSV rate sheet instead.",
+      "3) RateSheetName encodes entity + dates (e.g. 'Hapag-Lloyd HQ-Lazaro-01/06/2024-31/01/2025-...') to support this."
+    ]
+  },
+
+  "resolved_decisions": [
+    "[APPROVED] Vado2 -> 'Vado Gateway Terminal (APM Terminals)' override (also flag to DPO to add the alias).",
+    "[APPROVED] Length handling: include ONLY 20/40/45 ft; exclude all other lengths.",
+    "[APPROVED] Activities: use BEM quay activity_name values directly (the quay_move_activities include list); NO global-catalogue comparison.",
+    "[APPROVED] Rate basis: BEM = per single move; TOS = per single move; revenue = rate x moves (no /2). Per-activity 'per cycle' toggle halves the rate when needed.",
+    "[CONFIRMED] Sources: Stage 0 volume = GBL_moves_simulator (TOS); Stage 3 pricing = BEM_Pricing_Base."
+  ]
+}

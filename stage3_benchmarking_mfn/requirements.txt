@@ -1,0 +1,9 @@
+# Runtime
+streamlit>=1.30
+pandas>=2.0
+openpyxl>=3.1         # read Deals Results.xlsx + uploaded .xlsx rate sheets
+requests>=2.28        # used by dremio_connect.DremioClient
+
+# Dev / tooling
+pytest>=7.0
+oletools>=0.60        # only for reference extraction from the source .xlsm (VBA)

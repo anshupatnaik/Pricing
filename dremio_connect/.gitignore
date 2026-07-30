@@ -1,0 +1,11 @@
+# Never commit query output (may contain business data)
+*.csv
+
+# Never commit secrets
+*.env
+.env
+*token*
+
+# Python
+__pycache__/
+*.pyc
