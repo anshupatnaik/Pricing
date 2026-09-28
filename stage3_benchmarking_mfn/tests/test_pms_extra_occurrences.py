@@ -33,6 +33,14 @@ def test_oog_sql_exact_match_single_total():
     assert "GROUP BY" not in sql  # single scalar total, not per-length
 
 
+def test_gate_rates_sql_scopes_to_gate_operations_category():
+    # Truck/Rail current rates live under a different BEM category than quay ops,
+    # and must not be confused with sql_bem_quay_rates' 'Quay Operations' scope.
+    sql = queries.sql_bem_gate_rates("Barcelona", "HMM", ["Gate Move Truck", "Gate Move Rail"])
+    assert "category_name = 'Gate Operations'" in sql
+    assert "Gate Move Truck" in sql and "Gate Move Rail" in sql
+
+
 def test_overtime_sql_groups_by_indicator():
     sql = queries.sql_overtime_occurrences("T", [], [], "2025-01-01", "2025-12-31")
     assert "overtime_inidcator" in sql            # source column typo preserved

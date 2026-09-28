@@ -51,6 +51,26 @@ def sl_revenue_per_item(items, scenario_names, roe: float = 1.0) -> list[dict]:
     return out
 
 
+# Groups a blended overtime uplift % applies to (quay/vessel-move revenue only —
+# excludes Truck/Rail gate moves, OOG/hazard surcharges, and storage), matching
+# the Simple-mode overtime rule (see engine.overtime / the overtime-assumptions skill).
+QUAY_GROUPS = {"Vessel Moves-Gateway", "Vessel Moves-Restow on board"}
+
+
+def quay_revenue(items, scenario_names, roe: float = 1.0) -> dict[str, float]:
+    """SL revenue restricted to quay/vessel-move lines (:data:`QUAY_GROUPS`).
+
+    The base that a blended overtime uplift % (:func:`engine.pricing.average_overtime_uplift`)
+    multiplies, mirroring the Simple model's ``overtime_revenue = quay_revenue × pct``.
+    """
+    roe = roe or 1.0
+    quay_items = [it for it in items if it.vessel_move and it.group in QUAY_GROUPS]
+    return {
+        s: sum(it.occurrences * float(it.rates.get(s, 0.0) or 0.0) / roe for it in quay_items)
+        for s in scenario_names
+    }
+
+
 def bco_revenue(items) -> float:
     """Total BCO revenue (scenario-independent) = Σ occurrences × BCO rate."""
     return sum(it.occurrences * (it.bco_rate or 0.0) for it in items)

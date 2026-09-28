@@ -27,6 +27,14 @@ QUAY_INCLUDE_ACTIVITIES = [
     "Restow Move - Via Quay - Premium Service", "Restow Move - Cell to Cell - Premium Service",
 ]
 
+# BEM activity_name values for landside gate legs (Truck/Rail), category_name='Gate Operations'
+# (a separate category from quay ops — see QUAY_INCLUDE_ACTIVITIES above).
+GATE_INCLUDE_ACTIVITIES = [
+    "Gate Move Truck", "Gate Move Truck - Additional", "Gate Move Truck - Export",
+    "Gate Move Truck - Import", "Gate Move Truck - Import - Cabotage (Coastal)",
+    "Gate Move Rail",
+]
+
 # TOS operator code -> BEM.Customer brand (auto-suggestion only; overridable in the UI).
 CUSTOMER_HINTS = {
     "MAE": "MAERSK", "MAEU": "MAERSK", "MSK": "MAERSK",

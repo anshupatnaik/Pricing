@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 
 from engine.pricing import (
-    apply_basis, choose_rate_sheet, match_rate, parse_tos_key, rates_for_keys,
-    parse_rate, oog_surcharge, overtime_rate, parse_overtime_indicator,
+    apply_basis, average_overtime_uplift, choose_rate_sheet, match_rate, parse_tos_key,
+    rates_for_keys, parse_rate, oog_surcharge, overtime_rate, parse_overtime_indicator,
 )
 
 
@@ -79,6 +79,24 @@ def test_match_exact_then_blended():
     assert match_rate(a, sheet)["Rate"] == 100          # exact length wins
     a40 = parse_tos_key("Full-Discharge-40")
     assert match_rate(a40, sheet)["Rate"] == 95          # falls back to blended Any
+
+
+def test_parse_truck_and_rail_keys():
+    t = parse_tos_key("Truck-Full-40")
+    assert t.category == "Truck" and t.freight == "Full" and t.length == "40"
+    r = parse_tos_key("Rail-Empty-20")
+    assert r.category == "Rail" and r.freight == "Empty" and r.length == "20"
+
+
+def test_match_truck_and_rail_to_gate_move_activity():
+    sheet = [_row("S", "2026-01-01", "2026-12-31", activity="Gate Move Truck",
+                  freight="Full", length="40 ft", rate=56.27),
+             _row("S", "2026-01-01", "2026-12-31", activity="Gate Move Rail",
+                  freight="Empty", length="20 ft", rate=53.03)]
+    assert match_rate(parse_tos_key("Truck-Full-40"), sheet)["Rate"] == 56.27
+    assert match_rate(parse_tos_key("Rail-Empty-20"), sheet)["Rate"] == 53.03
+    # cross-mode: a Rail row doesn't satisfy a Truck key, and vice versa
+    assert match_rate(parse_tos_key("Truck-Empty-20"), sheet) is None
 
 
 def test_match_transhipment_activity():
@@ -186,3 +204,49 @@ def test_overtime_excludes_gate_category():
 def test_overtime_category_fallback_when_no_ld_row():
     rows = [_ot("Hatch Cover Move", "Sunday", "Sunday", "00:00", "23:59", "90%")]
     assert overtime_rate("Sunday - 12:00-12:59", rows, 100.0)["rate"] == 90.0
+
+
+# --- blended overtime uplift (the Detailed-mode alternative to banded rates) --
+# A full week is 168 hours; the average must count every hour, including the
+# implicit-0% ones no surcharge row ever lists (a bug caught by manual reconciliation
+# against the pricing manager's own weekly Overtime matrix, e.g. HMM's Barcelona sheet).
+def test_average_overtime_uplift_counts_implicit_zero_hours():
+    # A single 8h weekday-morning band (Mon-Fri 00:00-07:00 @ 20%): 5 days x 8h = 40
+    # hours at 20%, the other 128 hours of the week are implicitly 0%.
+    rows = [_ot("Load or Discharge Move", "Monday", "Friday", "00:00", "07:00", "20%")]
+    expected = (5 * 8 * 0.20) / 168
+    assert average_overtime_uplift(rows) == pytest.approx(expected)
+    assert average_overtime_uplift(rows) < 0.20  # naive row-average (0.20) would be wrong
+
+
+def test_average_overtime_uplift_all_day_band_via_equal_start_end():
+    # 'Saturday 02:00-02:00' is BEM's all-day convention (see _time_in_range), so
+    # this should cover all 24 Saturday hours, not just the single 02:00 slot.
+    rows = [_ot("Load or Discharge Move", "Saturday", "Saturday", "02:00", "02:00", "35%")]
+    expected = (24 * 0.35) / 168
+    assert average_overtime_uplift(rows) == pytest.approx(expected)
+
+
+def test_average_overtime_uplift_ignores_holiday_calendar_bands():
+    # 'Holidays' / 'Day before Holidays' aren't fixed weekdays and can't sit on a
+    # recurring 24x7 grid, so they must not enter the average at all.
+    rows = [_ot("Load or Discharge Move", "Holidays", "Holidays", "02:00", "02:00", "55%")]
+    assert average_overtime_uplift(rows) == 0.0
+
+
+def test_average_overtime_uplift_excludes_fixed_and_gate():
+    rows = [
+        _ot("Load or Discharge Move", "Monday", "Friday", "00:00", "07:00", "500", "fixed"),
+        _ot("Gate Move Rail", "Saturday", "Saturday", "08:00", "20:00", "999%", cat="Gate Operations"),
+    ]
+    assert average_overtime_uplift(rows) == 0.0
+
+
+def test_average_overtime_uplift_empty_is_zero():
+    assert average_overtime_uplift([]) == 0.0
+
+
+def test_time_in_range_equal_start_end_is_all_day():
+    from engine.pricing import _time_in_range
+    assert _time_in_range(0, "02:00", "02:00") is True
+    assert _time_in_range(23 * 60 + 59, "02:00", "02:00") is True
