@@ -32,6 +32,9 @@ ACTIVITY_PRIORITY = {
                         "Restow Move - Cell to Cell"],
     "Restow on board": ["Restow Move - Cell to Cell", "Restow Move - Cell to Cell - Premium Service",
                         "Restow Move - via Quay"],
+    "Truck": ["Gate Move Truck", "Gate Move Truck - Export", "Gate Move Truck - Import",
+              "Gate Move Truck - Import - Cabotage (Coastal)", "Gate Move Truck - Additional"],
+    "Rail": ["Gate Move Rail"],
 }
 # activities whose pricing is commonly per full cycle (2 moves); default still per-move
 CYCLE_PRONE = {"Transhipment", "Restow via quay", "Restow on board"}
@@ -269,6 +272,8 @@ def _time_in_range(minute, start_t, end_t) -> bool:
     s, e = _to_min(start_t), _to_min(end_t)
     if s is None or e is None:
         return False
+    if s == e:
+        return True  # BEM's all-day convention (e.g. '02:00'-'02:00' means the full 24h)
     return s <= minute <= e if s <= e else (minute >= s or minute <= e)
 
 
@@ -315,6 +320,54 @@ def overtime_rate(indicator, sheet_rows, base_rate, activities=LD_ACTIVITIES,
                 "band": f"{r.get('start_day')}-{r.get('end_day')} "
                         f"{r.get('start_time')}-{r.get('end_time')}"}
     return None
+
+
+def average_overtime_uplift(sheet_rows, activities=LD_ACTIVITIES, categories=OVERTIME_CATEGORIES) -> float:
+    """Blended overtime uplift % — mean of a full 24x7 hour-of-week grid.
+
+    Mirrors the workbook's ``Overtime`` tab (one row per operator, averaged at
+    row 170): every hour of every weekday gets exactly one uplift % — 0% where no
+    band applies — and all 168 cells are averaged. This is NOT a mean of the raw
+    surcharge rows: those only list hours that carry a premium, so averaging them
+    directly silently drops every implicit-0% hour (the majority of a weekday) and
+    inflates the result.
+
+    Only recurring Monday-Sunday bands enter the grid — a one-off calendar band
+    (``Holidays``, ``Day before Holidays``) has no fixed weekday and can't be
+    placed on it, so it's excluded, same as it would be from a real weekly
+    average. Eligibility (Quay/Vessel-Marine only, percentage-typed, never Gate)
+    matches :func:`overtime_rate`.
+    """
+    from .overtime import average_uplift
+    acts = {str(a).strip().lower() for a in activities}
+    cats = {str(c).strip().lower() for c in categories}
+
+    def eligible(r):
+        return (str(r.get("activity_name") or "").strip().lower() in acts
+                or str(r.get("category") or "").strip().lower() in cats)
+
+    bands = []
+    for r in sheet_rows:
+        if not eligible(r):
+            continue
+        sd = str(r.get("start_day") or "").strip().lower()
+        ed = str(r.get("end_day") or "").strip().lower()
+        if sd not in _DAYS or ed not in _DAYS:
+            continue  # one-off calendar band, not a recurring weekday
+        kind, val = parse_rate(r.get("overtime_rate"), r.get("overtime_metric"))
+        if kind == "percentage" and val is not None:
+            bands.append((sd, ed, r.get("start_time"), r.get("end_time"), val))
+
+    grid = []
+    for day in _DAYS:
+        for hour in range(24):
+            minute = hour * 60
+            rate = 0.0
+            for sd, ed, st, et, val in bands:
+                if _day_in_range(day, sd, ed) and _time_in_range(minute, st, et):
+                    rate = max(rate, val)
+            grid.append(rate)
+    return average_uplift(grid)
 
 
 def rates_for_keys(tos_keys, sheet_rows, basis_by_category=None) -> dict:

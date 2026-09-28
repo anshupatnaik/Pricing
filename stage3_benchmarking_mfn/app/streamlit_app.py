@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -24,9 +25,11 @@ from engine.methodology import derive_from_pct, validate_ordering  # noqa: E402
 from engine.occurrences import OOG_ITEM  # noqa: E402
 from engine.pricing import parse_overtime_indicator  # noqa: E402
 from engine.result import run_detailed  # noqa: E402
-from engine.revenue import PmsItem, sl_revenue_per_item  # noqa: E402
+from engine.revenue import PmsItem, QUAY_GROUPS, sl_revenue_per_item  # noqa: E402
 from engine.simple_model import SimpleInputs, run_simple  # noqa: E402
 from engine import deals as deals_mod  # noqa: E402
+from engine import storage as storage_mod  # noqa: E402
+from engine import reefer as reefer_mod  # noqa: E402
 from app.summary import components_frame, summary_to_frame  # noqa: E402
 from app.ratesheet import parse_rate_sheet, parse_rate_sheet_by_item  # noqa: E402
 from app import store  # noqa: E402
@@ -45,6 +48,111 @@ def _representative_ld_rate(px_rates: dict) -> float:
             return float(px_rates[k])
     ld = [float(v) for k, v in px_rates.items() if v and ("-Load-" in k or "-Discharge-" in k)]
     return max(ld) if ld else 0.0
+
+
+# Full Storage dwell-distribution chart: fixed category -> (label, color) so Import/
+# Export/Transshipment always carry the same identity across views (never cycled).
+STORAGE_CATEGORY_STYLE = {
+    "IMPRT": ("Import", "#2a78d6"),
+    "EXPRT": ("Export", "#eb6834"),
+    "TRSHP": ("Transshipment", "#1baf7a"),
+}
+
+
+def render_dwell_distribution(dwell_rows: list[dict]) -> None:
+    """Bar chart of container_count x dwell_days, one small multiple per category."""
+    if not dwell_rows:
+        return
+    df = pd.DataFrame(dwell_rows)
+    present = [c for c in STORAGE_CATEGORY_STYLE if c in df["category"].unique()]
+    if not present:
+        return
+    st.caption("**Dwell distribution**")
+    cols = st.columns(len(present))
+    for col, cat in zip(cols, present):
+        label, color = STORAGE_CATEGORY_STYLE[cat]
+        sub = df[df["category"] == cat].sort_values("dwell_days")
+        chart = (
+            alt.Chart(sub)
+            .mark_bar(color=color)
+            .encode(
+                x=alt.X("dwell_days:Q", title="Dwell days"),
+                y=alt.Y("container_count:Q", title="Containers"),
+                tooltip=[
+                    alt.Tooltip("dwell_days:Q", title="Dwell days"),
+                    alt.Tooltip("container_count:Q", title="Containers", format=",.0f"),
+                ],
+            )
+            .properties(title=f"{label} ({sub['container_count'].sum():,.0f} containers)", height=220)
+        )
+        col.altair_chart(chart, use_container_width=True)
+
+
+def render_tariff_editor(categories, tariffs, names, pct_by, key_prefix, free_label):
+    """Editable per-scenario free-threshold + tier-rate grids for a set of
+    :class:`engine.storage.StorageTariff` categories.
+
+    Shared shape across Full Storage (free days, per Import/Export/Transshipment),
+    Empty Storage Logic 2 (free days, one 'EMPTY' category) and Logic 1 (free
+    pool Y in TEU, one category) — all reduce to "a free threshold, then N
+    tiers, editable per scenario". ``free_label`` names what the threshold
+    means for the caption (e.g. "Free days" vs "Free pool (TEU)").
+
+    Tier ``start``/``end`` are editable columns (not a read-only label) and the
+    grid allows adding/deleting rows (``num_rows="dynamic"``) — a manager can
+    add a new bracket against a different tariff, e.g. splitting one tier into
+    two, or adding a 4th progressive tier. Leave ``end`` blank for open-ended
+    (through the end of dwell / no upper bound on the excess).
+    """
+    free_df = pd.DataFrame({"category": categories})
+    for n in names:
+        free_df[n] = [tariffs[c].free_days for c in categories]
+    st.caption(f"**{free_label} per scenario**")
+    free_df = st.data_editor(free_df, use_container_width=True,
+                             key=f"{key_prefix}_free_editor", hide_index=True)
+
+    tier_rows = []
+    for c in categories:
+        for start, end, rate in tariffs[c].tiers:
+            tier_rows.append({"category": c, "start": start,
+                              "end": None if end >= storage_mod.UNBOUNDED_TIER_END else end,
+                              "_rate": rate})
+    tier_base = pd.DataFrame(tier_rows, columns=["category", "start", "end", "_rate"])
+    for n in names:
+        tier_base[n] = [row["_rate"] * (1.0 + pct_by.get(n, 0.0)) for row in tier_rows]
+    st.caption("**Tier rate per scenario** — Current from pricing; others derive as "
+               "Current×(1+%); edit any cell to override. Add a row for a new tier/bracket "
+               "(leave **end** blank for open-ended); edit **start**/**end** to change where "
+               f"a bracket applies, or edit {free_label.lower()} above to change where charging starts.")
+    tier_df = st.data_editor(tier_base[["category", "start", "end"] + names],
+                             use_container_width=True, num_rows="dynamic",
+                             key=f"{key_prefix}_tier_editor", hide_index=True)
+    return free_df, tier_df
+
+
+def scenario_storage_tariffs(categories, tariffs, free_df, tier_df, names):
+    """Per-scenario ``{category: StorageTariff}`` built from edited grids
+    (:func:`render_tariff_editor`'s output) — the per-scenario input
+    :func:`engine.storage.total_storage_revenue` / :func:`engine.storage.pool_revenue` need."""
+    free_lookup = {r["category"]: r for _, r in free_df.iterrows()}
+    tier_lookup: dict[str, list] = {}
+    for _, r in tier_df.iterrows():
+        cat = r.get("category")
+        if not cat or pd.isna(r.get("start")):
+            continue
+        start = int(float(r["start"]))
+        end_raw = r.get("end")
+        end = storage_mod.UNBOUNDED_TIER_END if end_raw in (None, "") or pd.isna(end_raw) else int(float(end_raw))
+        tier_lookup.setdefault(cat, []).append((start, end, r))
+    out = {}
+    for n in names:
+        scen_tariffs = {}
+        for c in categories:
+            free_val = int(free_lookup.get(c, {}).get(n, tariffs[c].free_days) or 0)
+            tiers = [(start, end, float(row.get(n, 0.0) or 0.0)) for start, end, row in tier_lookup.get(c, [])]
+            scen_tariffs[c] = storage_mod.StorageTariff(free_days=free_val, tiers=tiers)
+        out[n] = scen_tariffs
+    return out
 
 
 # Simple-mode line -> representative TOS key (to pull a per-move pricing rate)
@@ -301,13 +409,23 @@ if mode == MODE_DETAILED:
         oc1, oc2, oc3 = st.columns(3)
         inc_gate = oc1.checkbox("Truck & Rail gate moves", value=True)
         inc_oog = oc2.checkbox("OOG surcharge", value=True)
-        inc_ot = oc3.checkbox("Overtime day-hour buckets", value=True)
+        inc_ot = oc3.checkbox("Overtime day-hour buckets", value=True,
+                              help="Only used by the Banded overtime method below.")
+
+    ot_method = st.radio(
+        "Overtime method", ["Average uplift % (blended)", "Banded hourly rates (specific slots)"],
+        index=0, horizontal=True,
+        help="Blended (default): one averaged % applied to ALL quay/vessel-move revenue, "
+             "matching the Simple-mode default (Overtime!D170-style average). Banded: a specific "
+             "%/rate applies only to the moves that actually happened in that exact hour-bucket.")
+    ot_banded = ot_method.startswith("Banded")
+
     if st.button("Fetch occurrences from Dremio", disabled=repo is None):
         try:
             with st.spinner("Querying Dremio…"):
                 occ = repo.get_occurrences(terminal, operators, services, date_from, date_to,
                                            include_gate=inc_gate, include_oog=inc_oog,
-                                           include_overtime=inc_ot)
+                                           include_overtime=inc_ot and ot_banded)
             st.session_state["occ"] = [
                 {"item": o.item, "group": o.group, "vessel_move": o.vessel_move,
                  "occurrences": o.count, "annualized": o.annualized or 0.0} for o in occ]
@@ -342,23 +460,48 @@ if mode == MODE_DETAILED:
                 oog_res = repo.get_oog_surcharge(terminal, bem_op, base_ld, TODAY, is_standard_code=True)
                 if oog_res["oog"]:
                     rates[OOG_ITEM] = oog_res["oog"]["rate"]
-                ot_inds = [it for it in items_list if parse_overtime_indicator(it)]
-                ot_res = repo.get_overtime_rates(terminal, bem_op, ot_inds, base_ld, TODAY,
-                                                 is_standard_code=True)
-                rates.update({ind: r["rate"] for ind, r in ot_res["rates"].items()})
+                ot_res = {"rates": {}}
+                if ot_banded:
+                    ot_inds = [it for it in items_list if parse_overtime_indicator(it)]
+                    ot_res = repo.get_overtime_rates(terminal, bem_op, ot_inds, base_ld, TODAY,
+                                                     is_standard_code=True)
+                    rates.update({ind: r["rate"] for ind, r in ot_res["rates"].items()})
+                else:
+                    ot_uplift_res = repo.get_overtime_uplift(terminal, bem_op, TODAY,
+                                                             is_standard_code=True)
+                    st.session_state["ot_uplift_pct"] = ot_uplift_res["pct"]
+                # Truck/Rail gate legs are a separate BEM category (Gate Operations),
+                # not priced under Quay Operations like the base move.
+                gate_items = [it for it in items_list if it.startswith("Truck-") or it.startswith("Rail-")]
+                gate_res = repo.get_gate_rates(terminal, bem_op, gate_items, TODAY,
+                                               is_standard_code=True) if gate_items else {"rates": {}}
+                rates.update({k: v["rate"] for k, v in gate_res["rates"].items()})
             st.session_state["px_rates"] = rates
             st.session_state["px_sheet"] = res["sheet"]
             extra = []
             if oog_res["oog"]:
                 extra.append("OOG")
-            if ot_res["rates"]:
+            if ot_banded and ot_res["rates"]:
                 extra.append(f"{len(ot_res['rates'])} overtime bands")
+            if not ot_banded:
+                extra.append(f"overtime uplift {st.session_state.get('ot_uplift_pct', 0.0) * 100:.2f}% (blended)")
+            if gate_res["rates"]:
+                extra.append(f"{len(gate_res['rates'])} gate (Truck/Rail)")
             st.success(f"Pulled {len(res['rates'])} current rates for {bem_op}"
                        + (f" (+ {', '.join(extra)})" if extra else "") + ".")
         except Exception as e:  # noqa: BLE001
             st.error(f"Pricing pull failed: {e}")
     show_sheet_info(st.session_state.get("px_sheet"))
     px = st.session_state.get("px_rates", {})
+
+    ot_pct = 0.0
+    if not ot_banded:
+        ot_pct = st.number_input(
+            "Overtime uplift % — blended (fraction, e.g. 0.2187 = 21.87%; "
+            "auto-filled by 'Pull current rates', editable)",
+            value=float(st.session_state.get("ot_uplift_pct", 0.0)), format="%.4f", step=0.01)
+        st.caption(f"Applies to quay/vessel-move revenue only "
+                   f"({', '.join(sorted(QUAY_GROUPS))}), per scenario.")
 
     up_d = st.file_uploader("…or upload a rate sheet (CSV/XLSX) → Current", type=["csv", "xlsx"],
                             key="ratesheet_detailed")
@@ -402,6 +545,142 @@ if mode == MODE_DETAILED:
                                value=float(default_vc) if default_vc is not None else -32.0)
     include_bco = True  # BCO always computed; summary shows with & without
 
+    st.markdown("**Full Storage** — dwell-tariff revenue, editable per scenario "
+                "(different customers/scenarios can carry different free time and tier rates)")
+    if st.button("Pull storage dwell + tariff (Dremio)", disabled=repo is None or not bem_op):
+        try:
+            with st.spinner("Querying storage dwell + tariff…"):
+                dwell = repo.get_storage_dwell(terminal, operators, date_from, date_to)
+                tariff_res = repo.get_storage_tariffs(terminal, bem_op, TODAY, is_standard_code=True)
+            st.session_state["storage_dwell"] = [
+                {"category": b.category, "dwell_days": b.dwell_days, "container_count": b.container_count}
+                for b in dwell]
+            st.session_state["storage_tariffs"] = tariff_res["tariffs"]
+            st.session_state["storage_sheet"] = tariff_res["sheet"]
+            n_containers = sum(b.container_count for b in dwell)
+            st.success(f"Pulled {len(dwell)} dwell buckets ({n_containers:,.0f} containers) "
+                       f"and tariffs for {len(tariff_res['tariffs'])} categor{'y' if len(tariff_res['tariffs']) == 1 else 'ies'}.")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Storage pull failed: {e}")
+    show_sheet_info(st.session_state.get("storage_sheet"))
+
+    storage_tariffs = st.session_state.get("storage_tariffs") or {}
+    storage_dwell_rows = st.session_state.get("storage_dwell") or []
+    storage_categories = sorted(storage_tariffs)
+
+    render_dwell_distribution(storage_dwell_rows)
+
+    if storage_categories:
+        free_days_df, tier_df = render_tariff_editor(
+            storage_categories, storage_tariffs, names, pct_by,
+            key_prefix="storage", free_label="Free days")
+    else:
+        free_days_df = pd.DataFrame()
+        tier_df = pd.DataFrame()
+        if bem_op:
+            st.caption("No Full Storage tariff pulled yet for this terminal/customer.")
+
+    st.markdown("**Empty Storage** — pool allowance or dwell-day tariff, editable per scenario")
+    empty_method = st.radio(
+        "Empty Storage method",
+        ["Free pool (daily TEU allowance)", "Dwell days (same as Full Storage)"],
+        index=0, horizontal=True,
+        help="Free pool (default): a daily TEU allowance Y; only the excess above it on "
+             "each calendar day is charged (dwell time is irrelevant). Dwell days: an "
+             "edge case — same free-days + tier model as Full Storage.")
+    empty_pool_mode = empty_method.startswith("Free pool")
+
+    if st.button("Pull empty storage tariff + volume (Dremio)", disabled=repo is None or not bem_op):
+        try:
+            with st.spinner("Querying empty storage…"):
+                if empty_pool_mode:
+                    tariff_res = repo.get_empty_pool_tariff(terminal, bem_op, TODAY, is_standard_code=True)
+                    occupancy = repo.get_empty_daily_occupancy(terminal, operators, date_from, date_to)
+                    st.session_state["empty_occupancy"] = occupancy
+                else:
+                    tariff_res = repo.get_empty_storage_tariff(terminal, bem_op, TODAY, is_standard_code=True)
+                    dwell = repo.get_empty_storage_dwell(terminal, operators, date_from, date_to)
+                    st.session_state["empty_dwell"] = [
+                        {"category": b.category, "dwell_days": b.dwell_days,
+                         "container_count": b.container_count} for b in dwell]
+            st.session_state["empty_tariff"] = tariff_res["tariff"]
+            st.session_state["empty_sheet"] = tariff_res["sheet"]
+            st.session_state["empty_pool_mode"] = empty_pool_mode
+            n_tiers = len(tariff_res["tariff"].tiers) if tariff_res["tariff"] else 0
+            st.success(f"Pulled empty storage tariff ({n_tiers} billing tier{'s' if n_tiers != 1 else ''}).")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Empty storage pull failed: {e}")
+    show_sheet_info(st.session_state.get("empty_sheet"))
+
+    empty_tariff = st.session_state.get("empty_tariff")
+    # a stale pull from the other method shouldn't be reused silently
+    empty_pulled_for_this_mode = empty_tariff is not None and st.session_state.get("empty_pool_mode") == empty_pool_mode
+    empty_categories: list[str] = []
+    empty_free_days_df = pd.DataFrame()
+    empty_tier_df = pd.DataFrame()
+    if empty_pulled_for_this_mode:
+        empty_categories = ["EMPTY"]
+        empty_tariffs_by_cat = {"EMPTY": empty_tariff}
+        if empty_pool_mode:
+            occ = st.session_state.get("empty_occupancy") or {}
+            if occ:
+                st.caption(f"Daily occupancy pulled: {len(occ):,} days, "
+                           f"avg {sum(occ.values()) / len(occ):,.0f} TEU/day, "
+                           f"peak {max(occ.values()):,.0f} TEU.")
+            empty_free_days_df, empty_tier_df = render_tariff_editor(
+                empty_categories, empty_tariffs_by_cat, names, pct_by,
+                key_prefix="empty_pool", free_label="Free pool Y (TEU)")
+        else:
+            empty_free_days_df, empty_tier_df = render_tariff_editor(
+                empty_categories, empty_tariffs_by_cat, names, pct_by,
+                key_prefix="empty_dwell", free_label="Free days")
+    elif bem_op:
+        st.caption("No Empty Storage tariff pulled yet for this terminal/customer/method.")
+
+    st.markdown("**Reefer Storage** — flat daily rate × average dwell (no tiering), editable per scenario")
+    reefer_unbundled = st.checkbox(
+        "Unbundle (separate plug-in/plug-out, electricity, monitoring)", value=False,
+        help="Default: one bundled daily rate covers all three. Unbundled: a one-time "
+             "plug-in/plug-out fee per container, plus separate daily electricity and "
+             "monitoring rates.")
+
+    if st.button("Pull reefer tariff + volume (Dremio)", disabled=repo is None or not bem_op):
+        try:
+            with st.spinner("Querying reefer storage…"):
+                vol = repo.get_reefer_volume(terminal, operators, date_from, date_to)
+                tariff_res = repo.get_reefer_tariff(terminal, bem_op, TODAY, is_standard_code=True)
+            st.session_state["reefer_volume"] = vol
+            st.session_state["reefer_rates"] = tariff_res
+            st.success(f"Pulled {vol['container_count']:,.0f} reefer containers, "
+                       f"avg dwell {vol['avg_dwell_days']:.2f} days.")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Reefer pull failed: {e}")
+    show_sheet_info(st.session_state.get("reefer_rates", {}).get("sheet"))
+
+    reefer_volume = st.session_state.get("reefer_volume")
+    reefer_rates = st.session_state.get("reefer_rates") or {}
+    reefer_df = pd.DataFrame()
+    if reefer_volume:
+        st.caption(f"Reefer volume pulled: {reefer_volume['container_count']:,.0f} containers, "
+                   f"avg dwell {reefer_volume['avg_dwell_days']:.2f} days "
+                   "(dwell time is only used as an average here — the daily rate never tiers).")
+        if reefer_unbundled:
+            fields = [
+                ("Plug fee (one-time, per container)", reefer_rates.get("plug_fee") or 0.0),
+                ("Electricity ($/day)", reefer_rates.get("electricity_daily") or 0.0),
+                ("Monitoring ($/day)", reefer_rates.get("monitoring_daily") or 0.0),
+            ]
+        else:
+            fields = [("Daily reefer rate (bundled)", reefer_rates.get("bundled_daily_rate") or 0.0)]
+        reefer_base = pd.DataFrame({"field": [f for f, _ in fields]})
+        for n in names:
+            reefer_base[n] = [v * (1.0 + pct_by.get(n, 0.0)) for _, v in fields]
+        st.caption("Current from pricing; others derive as Current×(1+%); edit any cell to override.")
+        reefer_df = st.data_editor(reefer_base, use_container_width=True,
+                                   key="reefer_rate_editor", hide_index=True)
+    elif bem_op:
+        st.caption("No reefer tariff pulled yet for this terminal/customer.")
+
     if st.button("Run detailed simulation", type="primary"):
         occ_lookup = {r["item"]: r for _, r in occ_df.iterrows()}
         # normalized basis: scale so total vessel-move occurrences hit the target
@@ -419,8 +698,56 @@ if mode == MODE_DETAILED:
                 rates={n: float(rr.get(n, 0.0) or 0.0) for n in names},
                 vessel_move=bool(o.get("vessel_move", True)),
                 bco_rate=float(rr.get("BCO per occurrence (USD)", 0.0) or 0.0)))
+
+        storage_by_scenario = None
+        if storage_categories:
+            dwell_buckets = [storage_mod.DwellBucket(category=r["category"], dwell_days=r["dwell_days"],
+                                                     container_count=r["container_count"])
+                             for r in storage_dwell_rows]
+            scen_tariffs_by_name = scenario_storage_tariffs(
+                storage_categories, storage_tariffs, free_days_df, tier_df, names)
+            storage_by_scenario = {n: storage_mod.total_storage_revenue(dwell_buckets, scen_tariffs_by_name[n])
+                                   for n in names}
+
+        empty_by_scenario = None
+        if empty_categories:
+            scen_empty_tariffs = scenario_storage_tariffs(
+                empty_categories, {"EMPTY": empty_tariff}, empty_free_days_df, empty_tier_df, names)
+            if empty_pool_mode:
+                occupancy_values = list((st.session_state.get("empty_occupancy") or {}).values())
+                empty_by_scenario = {n: storage_mod.pool_revenue(occupancy_values, scen_empty_tariffs[n]["EMPTY"])
+                                     for n in names}
+            else:
+                empty_dwell_rows = st.session_state.get("empty_dwell") or []
+                empty_buckets = [storage_mod.DwellBucket(category="EMPTY", dwell_days=r["dwell_days"],
+                                                         container_count=r["container_count"])
+                                 for r in empty_dwell_rows]
+                empty_by_scenario = {n: storage_mod.total_storage_revenue(empty_buckets, scen_empty_tariffs[n])
+                                     for n in names}
+
+        reefer_by_scenario = None
+        if reefer_volume and not reefer_df.empty:
+            field_lookup = {row["field"]: row for _, row in reefer_df.iterrows()}
+            reefer_by_scenario = {}
+            for n in names:
+                if reefer_unbundled:
+                    tariff = reefer_mod.ReeferTariff(
+                        unbundled=True,
+                        plug_fee=float(field_lookup["Plug fee (one-time, per container)"].get(n, 0.0) or 0.0),
+                        electricity_daily=float(field_lookup["Electricity ($/day)"].get(n, 0.0) or 0.0),
+                        monitoring_daily=float(field_lookup["Monitoring ($/day)"].get(n, 0.0) or 0.0))
+                else:
+                    tariff = reefer_mod.ReeferTariff(
+                        bundled_daily_rate=float(field_lookup["Daily reefer rate (bundled)"].get(n, 0.0) or 0.0))
+                reefer_by_scenario[n] = reefer_mod.reefer_revenue(
+                    reefer_volume["container_count"], reefer_volume["avg_dwell_days"], tariff)
+
         summary = run_detailed(items, scenarios, roe=roe, var_cost_per_move=var_cost,
-                               include_bco=include_bco, baseline_name=names[0])
+                               include_bco=include_bco, baseline_name=names[0],
+                               overtime_uplift_pct=None if ot_banded else ot_pct,
+                               storage_revenue=storage_by_scenario,
+                               empty_storage_revenue=empty_by_scenario,
+                               reefer_revenue=reefer_by_scenario)
         st.session_state["last_summary"] = summary
         st.session_state["sl_per_occ"] = {"rows": sl_revenue_per_item(items, names, roe),
                                           "scenarios": names}

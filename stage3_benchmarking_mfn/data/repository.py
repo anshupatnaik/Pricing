@@ -31,6 +31,42 @@ def _f(value) -> float:
         return 0.0
 
 
+def _parse_tier_row(r) -> tuple[int, int, float] | None:
+    """A Customer_Rate_Sheets tier row -> (start, end, rate), or None if unparseable.
+
+    A non-tiered row (``tier_start``/``tier_end`` both NULL — the common flat-rate
+    case, e.g. 'Empty Storage - Beyond Free Pool') becomes ``(0, UNBOUNDED)``:
+    since :func:`engine.storage.revenue_per_container` always clips a tier's
+    start to the tariff's ``free_days + 1`` anyway, a start of 0 is equivalent to
+    "applies to everything past the free allowance" — exactly what a flat
+    beyond-pool/beyond-free-days rate means.
+    """
+    from engine import storage
+    if r.get("rate") in (None, ""):
+        return None  # FREE_TEXT/description-only pricing — no structured rate to use
+    try:
+        start = int(float(r.get("tier_start"))) if r.get("tier_start") not in (None, "") else 0
+        end = (int(float(r.get("tier_end"))) if r.get("tier_end") not in (None, "")
+               else storage.UNBOUNDED_TIER_END)
+        rate = float(r.get("rate"))
+    except (TypeError, ValueError):
+        return None
+    return (start, end, rate)
+
+
+def _storage_category_from_activity(activity_name) -> str | None:
+    """'Full Storage - Import' -> 'IMPRT' (matches the dwell histogram's category
+    codes); None for anything that isn't one of the three directions."""
+    n = str(activity_name or "").lower()
+    if "import" in n:
+        return "IMPRT"
+    if "export" in n:
+        return "EXPRT"
+    if "transshipment" in n or "transhipment" in n:
+        return "TRSHP"
+    return None
+
+
 class MovesSimRepository:
     """Fetch vessel-moves inputs from Dremio for the SL revenue simulator."""
 
@@ -226,6 +262,29 @@ class MovesSimRepository:
         rates = pricing.rates_for_keys(tos_keys, chosen, basis_by_category)
         return {"rates": rates, "sheet": info}
 
+    def get_gate_rates(self, tos_terminal, operator, tos_keys, today,
+                      prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Current per-move Truck/Rail gate rates for the given TOS keys.
+
+        Same terminal/operator standardization and effective-sheet pick as
+        :meth:`get_current_rates`, scoped to BEM's ``Gate Operations`` category
+        (``Gate Move Truck`` / ``Gate Move Rail``) — a separate rate source from
+        quay ops, since gate legs aren't priced under ``Quay Operations``.
+        """
+        from engine import pricing
+        from .crosswalk import GATE_INCLUDE_ACTIVITIES
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return {"rates": {}, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(
+            queries.sql_bem_gate_rates(std, std_op, GATE_INCLUDE_ACTIVITIES, raw, std_col)
+        )
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        rates = pricing.rates_for_keys(tos_keys, chosen)
+        return {"rates": rates, "sheet": info}
+
     def get_oog_surcharge(self, tos_terminal, operator, base_ld_rate, today,
                           prefer_ratesheet_id=None, is_standard_code=False) -> dict:
         """Per-move OOG standard-spreader surcharge for the terminal + operator.
@@ -269,6 +328,208 @@ class MovesSimRepository:
             if r:
                 out[ind] = r
         return {"rates": out, "sheet": info}
+
+    def get_overtime_uplift(self, tos_terminal, operator, today,
+                           prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Blended overtime uplift % — the Detailed-mode alternative to per-bucket rates.
+
+        Same effective-sheet pick as :meth:`get_overtime_rates`, but averages every
+        eligible banded row into one % (:func:`engine.pricing.average_overtime_uplift`),
+        matching the workbook's ``Overtime!D170``-style average that Simple mode
+        already uses by default. Returns ``{'pct': <float>, 'sheet': <info>}``.
+        """
+        from engine import pricing
+        empty = {"pct": 0.0, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return empty
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(queries.sql_bem_overtime_rates(std, std_op, raw, std_col))
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        return {"pct": pricing.average_overtime_uplift(chosen), "sheet": info}
+
+    # -- Full Storage (dwell x tariff) -------------------------------------
+    def get_storage_dwell(self, terminal, operators, date_from, date_to) -> list:
+        """Full-container dwell buckets (:class:`engine.storage.DwellBucket`) for
+        the raw selected terminal + operator codes (same volume-source convention
+        as :meth:`get_occurrences` — no Std_Terminal join needed)."""
+        from engine.storage import DwellBucket
+
+        _, rows = self.client.query(queries.sql_storage_dwell(terminal, operators, date_from, date_to))
+        return [
+            DwellBucket(category=str(r.get("category") or ""),
+                       dwell_days=int(_f(r.get("dwell_days"))),
+                       container_count=_f(r.get("container_count")))
+            for r in rows
+        ]
+
+    def get_storage_tariffs(self, tos_terminal, operator, today,
+                            prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Full Storage tariff per category (IMPRT/EXPRT/TRSHP) for a terminal +
+        operator, from the effective-today Customer_Rate_Sheets sheet.
+
+        Same terminal/operator standardization and effective-sheet pick as
+        :meth:`get_current_rates`. Returns ``{'tariffs': {category:
+        engine.storage.StorageTariff}, 'sheet': <info>}``.
+        """
+        from engine import pricing, storage
+        empty = {"tariffs": {}, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return empty
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(queries.sql_storage_tariffs(std, std_op, raw, std_col))
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        by_category: dict[str, list] = {}
+        for r in chosen:
+            cat = _storage_category_from_activity(r.get("activity_name"))
+            tier = _parse_tier_row(r)
+            if cat is None or tier is None:
+                continue
+            by_category.setdefault(cat, []).append(tier)
+        tariffs = {cat: storage.build_tariff(tiers) for cat, tiers in by_category.items()}
+        return {"tariffs": tariffs, "sheet": info}
+
+    # -- Empty Storage: Logic 2 (same dwell-day model as Full Storage) ----
+    EMPTY_CATEGORY = "EMPTY"
+
+    def get_empty_storage_dwell(self, terminal, operators, date_from, date_to) -> list:
+        """Empty-container dwell buckets, tagged :data:`EMPTY_CATEGORY` so they
+        plug directly into :func:`engine.storage.total_storage_revenue` like
+        Full Storage's per-category buckets."""
+        from engine.storage import DwellBucket
+
+        _, rows = self.client.query(
+            queries.sql_empty_storage_dwell(terminal, operators, date_from, date_to))
+        return [
+            DwellBucket(category=self.EMPTY_CATEGORY, dwell_days=int(_f(r.get("dwell_days"))),
+                       container_count=_f(r.get("container_count")))
+            for r in rows
+        ]
+
+    def get_empty_storage_tariff(self, tos_terminal, operator, today,
+                                 prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Empty Storage dwell-day tariff ('Empty Storage' activity — free days,
+        then day-tiers, same shape as Full Storage). Returns ``{'tariff':
+        engine.storage.StorageTariff, 'sheet': <info>}``."""
+        from engine import pricing, storage
+        empty = {"tariff": None, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return empty
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(queries.sql_empty_storage_tariff(std, std_op, raw, std_col))
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        tiers = [t for t in (_parse_tier_row(r) for r in chosen) if t is not None]
+        return {"tariff": storage.build_tariff(tiers), "sheet": info}
+
+    # -- Empty Storage: Logic 1 (daily free-pool allowance) ----------------
+    def get_empty_pool_tariff(self, tos_terminal, operator, today,
+                              prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Empty Storage free-pool tariff (pool size Y as the zero-rate tier +
+        the beyond-pool rate/tiers, merged from 'Empty Storage - Free Pool' and
+        'Empty Storage - Beyond Free Pool'). A non-tiered beyond-pool row (no
+        TierStart/TierEnd — the common case) is treated as "0 to unbounded".
+        Returns ``{'tariff': engine.storage.StorageTariff, 'sheet': <info>}``.
+        """
+        from engine import pricing, storage
+        empty = {"tariff": None, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return empty
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(queries.sql_empty_pool_tariff(std, std_op, raw, std_col))
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        tiers = [t for t in (_parse_tier_row(r) for r in chosen) if t is not None]
+        return {"tariff": storage.build_tariff(tiers), "sheet": info}
+
+    def get_empty_daily_occupancy(self, terminal, operators, date_from, date_to) -> dict:
+        """Empty-container TEU occupancy per calendar day over the period.
+
+        Expands each presence interval (start date, end date, TEU/container x
+        container_count) across every day it covers, clipped to [date_from,
+        date_to], and sums TEU per day — dwell time itself never enters the
+        calculation, only how many TEU are present on a given day. Returns
+        ``{iso_date: total_teu}`` for every day the terminal had any presence
+        (a day with none simply doesn't appear — treat as 0).
+        """
+        from datetime import date as _date, timedelta
+
+        def _parse_date(s):
+            y, m, d = str(s)[:10].split("-")
+            return _date(int(y), int(m), int(d))
+
+        lo, hi = _parse_date(date_from), _parse_date(date_to)
+        _, rows = self.client.query(
+            queries.sql_empty_dwell_daily(terminal, operators, date_from, date_to)
+        )
+        occupancy: dict[str, float] = {}
+        for r in rows:
+            try:
+                start = max(_parse_date(r.get("start_date")), lo)
+                end = min(_parse_date(r.get("end_date")), hi)
+            except (TypeError, ValueError):
+                continue
+            if start > end:
+                continue
+            teu = _f(r.get("teu_per_container")) * _f(r.get("container_count"))
+            day = start
+            while day <= end:
+                key = day.isoformat()
+                occupancy[key] = occupancy.get(key, 0.0) + teu
+                day += timedelta(days=1)
+        return occupancy
+
+    # -- Reefer storage (flat daily rate x avg dwell; no tiering) ----------
+    def get_reefer_volume(self, terminal, operators, date_from, date_to) -> dict:
+        """Reefer container count + weighted average dwell days for the period.
+
+        Returns ``{'container_count': float, 'avg_dwell_days': float}``. The
+        average is container_days / container_count (weighted by each row's
+        Container_Count), not a naive per-row mean.
+        """
+        _, rows = self.client.query(
+            queries.sql_reefer_volume(terminal, operators, date_from, date_to))
+        count = _f(rows[0].get("container_count")) if rows else 0.0
+        days = _f(rows[0].get("container_days")) if rows else 0.0
+        return {"container_count": count, "avg_dwell_days": (days / count) if count else 0.0}
+
+    def get_reefer_tariff(self, tos_terminal, operator, today,
+                          prefer_ratesheet_id=None, is_standard_code=False) -> dict:
+        """Reefer rates for a terminal + operator: the bundled daily rate and
+        the three unbundled components. Returns ``{'bundled_daily_rate',
+        'plug_fee', 'electricity_daily', 'monitoring_daily'}`` (each ``None``
+        when that activity has no signed rate) plus ``'sheet'``.
+        """
+        from engine import pricing
+        empty = {"bundled_daily_rate": None, "plug_fee": None, "electricity_daily": None,
+                 "monitoring_daily": None, "sheet": {"ratesheet_name": None, "ambiguous": False, "candidates": []}}
+        std = self.standard_terminal(tos_terminal)
+        std_op = operator if is_standard_code else self.resolve_operator(operator)
+        if not std or not std_op:
+            return empty
+        raw, std_col = self.terminal_cols()
+        _, rows = self.client.query(queries.sql_reefer_tariff(std, std_op, raw, std_col))
+        chosen, info = pricing.choose_rate_sheet(rows, today, prefer_id=prefer_ratesheet_id)
+        by_activity: dict[str, float] = {}
+        for r in chosen:
+            name = r.get("activity_name")
+            if name not in by_activity and r.get("rate") not in (None, ""):
+                try:
+                    by_activity[name] = float(r.get("rate"))
+                except (TypeError, ValueError):
+                    continue
+        return {
+            "bundled_daily_rate": by_activity.get("Daily Reefer Service"),
+            "plug_fee": by_activity.get("Reefer Plug-in or Unplug"),
+            "electricity_daily": by_activity.get("Daily Reefer Service - Electricity Only"),
+            "monitoring_daily": by_activity.get("Daily Reefer Service - Monitoring Only"),
+            "sheet": info,
+        }
 
     def get_shares(self, terminal, operators, services, date_from, date_to,
                    reefer_dwell: float = 1.0) -> dict:

@@ -17,13 +17,19 @@ def summary_to_frame(summary: SimulationSummary) -> pd.DataFrame:
         moves = r.total_moves or 0.0
         if summary.mode == MODE_DETAILED:
             sl = r.components.get("SL", 0.0) or 0.0
+            ot = r.components.get("OT", 0.0) or 0.0
+            storage = r.components.get("Storage", 0.0) or 0.0
+            empty_storage = r.components.get("EmptyStorage", 0.0) or 0.0
+            reefer = r.components.get("Reefer", 0.0) or 0.0
             bco = r.components.get("BCO", 0.0) or 0.0
             vc = r.variable_cost or 0.0
-            total_excl = sl
-            total_incl = sl + bco
+            total_excl = sl + ot + storage + empty_storage + reefer
+            total_incl = sl + ot + storage + empty_storage + reefer + bco
             row = {
                 "Scenario": r.name, "Role": r.role, "Total Moves": moves,
-                "SL Revenue": sl, "BCO Revenue": bco,
+                "SL Revenue": sl, "Overtime (blended)": ot, "Storage Revenue": storage,
+                "Empty Storage Revenue": empty_storage, "Reefer Revenue": reefer,
+                "BCO Revenue": bco,
                 "Total Revenue (excl BCO)": total_excl,
                 "Total Revenue (incl BCO)": total_incl,
                 "RPM (excl BCO)": (total_excl / moves) if moves else None,

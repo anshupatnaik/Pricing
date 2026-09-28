@@ -5,7 +5,7 @@ import pytest
 
 from engine import (
     PmsItem, Scenario, derive_occurrences, move_key, overtime, methodology,
-    run_detailed, sl_revenue, total_vessel_moves,
+    quay_revenue, run_detailed, sl_revenue, total_vessel_moves,
 )
 from engine.occurrences import annualize, hazard_key
 from engine.simple_model import SimpleInputs, run_simple
@@ -88,6 +88,83 @@ def test_total_vessel_moves_excludes_non_vessel():
     items = _items() + [PmsItem("H", "IMO 3 Load/Discharge", occurrences=5,
                                 rates={"Current": 10}, vessel_move=False)]
     assert total_vessel_moves(items) == 20
+
+
+# --- blended overtime (average uplift % on quay revenue) ---------------------
+def test_quay_revenue_restricted_to_gateway_and_restow():
+    items = [
+        PmsItem("Vessel Moves-Gateway", "Full-Load-40", occurrences=10, rates={"Current": 50.0}),
+        PmsItem("Vessel Moves-Restow on board", "Restow on board-Full-20", occurrences=4,
+                rates={"Current": 20.0}),
+        PmsItem("Truck Moves", "Truck-Full-40", occurrences=100, rates={"Current": 30.0},
+                vessel_move=False),
+    ]
+    rev = quay_revenue(items, ["Current"], roe=1.0)
+    assert rev["Current"] == pytest.approx(10 * 50.0 + 4 * 20.0)  # Truck excluded from the base
+
+
+def test_run_detailed_blended_overtime_adds_ot_component():
+    items = [
+        PmsItem("Vessel Moves-Gateway", "Full-Load-40", occurrences=10,
+                rates={"Current": 50.0, "Floor": 40.0}),
+        PmsItem("Truck Moves", "Truck-Full-40", occurrences=100,
+                rates={"Current": 30.0, "Floor": 25.0}, vessel_move=False),
+    ]
+    scen = [Scenario("Current", "current"), Scenario("Floor", "floor")]
+    s = run_detailed(items, scen, roe=1.0, baseline_name="Current", overtime_uplift_pct=0.20)
+    cur = {r.name: r for r in s.scenarios}["Current"]
+    assert cur.components["OT"] == pytest.approx(500.0 * 0.20)     # 20% of quay-only revenue
+    assert cur.total_revenue == pytest.approx(500.0 + 3000.0 + 100.0)  # SL (quay+truck) + OT
+    # default path (overtime_uplift_pct=None) never adds an OT component at all
+    s2 = run_detailed(items, scen, roe=1.0, baseline_name="Current")
+    assert "OT" not in s2.scenarios[0].components
+
+
+def test_run_detailed_storage_revenue_is_per_scenario_and_additive():
+    items = [PmsItem("Vessel Moves-Gateway", "Full-Load-40", occurrences=10, rates={"Current": 50.0})]
+    scen = [Scenario("Current", "current"), Scenario("Floor", "floor")]
+    storage_by_scenario = {"Current": 1000.0, "Floor": 800.0}  # e.g. Floor = looser free days
+    s = run_detailed(items, scen, roe=1.0, baseline_name="Current",
+                     storage_revenue=storage_by_scenario)
+    by = {r.name: r for r in s.scenarios}
+    assert by["Current"].components["Storage"] == 1000.0
+    assert by["Floor"].components["Storage"] == 800.0
+    assert by["Current"].total_revenue == pytest.approx(500.0 + 1000.0)  # SL + Storage
+    # a scenario missing from the dict gets 0, not a crash
+    s2 = run_detailed(items, scen, roe=1.0, baseline_name="Current",
+                      storage_revenue={"Current": 1000.0})
+    assert s2.scenarios[1].components["Storage"] == 0.0
+    # default path (storage_revenue=None) never adds a Storage component at all
+    s3 = run_detailed(items, scen, roe=1.0, baseline_name="Current")
+    assert "Storage" not in s3.scenarios[0].components
+
+
+def test_run_detailed_full_and_empty_storage_are_separate_components():
+    items = [PmsItem("Vessel Moves-Gateway", "Full-Load-40", occurrences=10, rates={"Current": 50.0})]
+    scen = [Scenario("Current", "current")]
+    s = run_detailed(items, scen, roe=1.0, baseline_name="Current",
+                     storage_revenue={"Current": 1000.0},
+                     empty_storage_revenue={"Current": 300.0})
+    cur = s.scenarios[0]
+    assert cur.components["Storage"] == 1000.0
+    assert cur.components["EmptyStorage"] == 300.0
+    assert cur.total_revenue == pytest.approx(500.0 + 1000.0 + 300.0)  # SL + Storage + EmptyStorage
+    # default path never adds an EmptyStorage component at all
+    s2 = run_detailed(items, scen, roe=1.0, baseline_name="Current")
+    assert "EmptyStorage" not in s2.scenarios[0].components
+
+
+def test_run_detailed_reefer_is_its_own_component():
+    items = [PmsItem("Vessel Moves-Gateway", "Full-Load-40", occurrences=10, rates={"Current": 50.0})]
+    scen = [Scenario("Current", "current")]
+    s = run_detailed(items, scen, roe=1.0, baseline_name="Current",
+                     storage_revenue={"Current": 1000.0}, reefer_revenue={"Current": 400.0})
+    cur = s.scenarios[0]
+    assert cur.components["Reefer"] == 400.0
+    assert cur.components["Storage"] == 1000.0
+    assert cur.total_revenue == pytest.approx(500.0 + 1000.0 + 400.0)
+    s2 = run_detailed(items, scen, roe=1.0, baseline_name="Current")
+    assert "Reefer" not in s2.scenarios[0].components
 
 
 # --- overtime ----------------------------------------------------------------
